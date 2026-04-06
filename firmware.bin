@@ -1,1 +1,273 @@
+// ============================================================
+//  FeedTech OTA Test Sketch
+//
+//  Purpose:
+//    1) Boot Sierra RC7620 and connect to Telstra LTE
+//    2) Print "Hello World" every 5 seconds via Serial
+//    3) Check GitHub Pages for a newer firmware version
+//    4) Download and flash if a newer version is found
+//
+//  After this sketch is confirmed working, the full FeedTech
+//  sketch (with Blynk + OTA) can be pushed via OTA from here.
+//
+//  GitHub OTA server:
+//    https://rusty61.github.io/Feedtech_OTA/version.txt
+//    https://rusty61.github.io/Feedtech_OTA/firmware.bin
+//
+//  NOTE: GitHub Pages is HTTPS only -- TinyGsmClientSecure
+//        is used throughout, not TinyGsmClient.
+// ============================================================
 
+// ── Firmware version ─────────────────────────────────────────
+// Must match the string in version.txt exactly, including "v_"
+#define FIRMWARE_VERSION    "v_1.0.1"
+
+// ── OTA server (GitHub Pages) ────────────────────────────────
+#define OTA_SERVER          "rusty61.github.io"
+#define OTA_PORT            443                           // HTTPS
+#define OTA_VERSION_PATH    "/Feedtech_OTA/version.txt"
+#define OTA_FIRMWARE_PATH   "/Feedtech_OTA/firmware.bin"
+#define OTA_CHECK_INTERVAL  3600000UL                     // 1 hour
+
+// ── Sierra RC7620 modem setup ─────────────────────────────────
+#define TINY_GSM_MODEM_RC7620
+#define SerialMon  Serial
+
+#include <HardwareSerial.h>
+HardwareSerial SerialAT(1);   // UART1 on pins 40(RX) / 41(TX)
+
+#include <TinyGsmClient.h>
+#include <Update.h>
+
+TinyGsm            modem(SerialAT);
+TinyGsmClientSecure client(modem);   // SSL client for HTTPS
+
+// ── Telstra APN ───────────────────────────────────────────────
+const char apn[]  = "telstra.internet";
+const char user[] = "";
+const char pass[] = "";
+
+// ── Sierra RC7620 pins ────────────────────────────────────────
+#define HL_PWR_ON  42
+#define HL_RST_N   38
+#define HL_GP_2    39
+
+// ── Hello World timer ─────────────────────────────────────────
+unsigned long lastHelloMillis = 0;
+#define HELLO_INTERVAL  5000UL
+
+// ── Forward declarations ──────────────────────────────────────
+void sierra_Init();
+void connectNetwork();
+void performOTA();
+
+// ============================================================
+//  sierra_Init()
+// ============================================================
+void sierra_Init() {
+  SerialMon.println("sierra_Init(): Powering up RC7620...");
+
+  // Hold reset low during power-on sequence
+  pinMode(HL_RST_N, OUTPUT);
+  digitalWrite(HL_RST_N, LOW);
+
+  // Power-on pulse >= 200 ms
+  pinMode(HL_PWR_ON, OUTPUT);
+  digitalWrite(HL_PWR_ON, HIGH);
+  delay(3500);
+  digitalWrite(HL_PWR_ON, LOW);
+  delay(7000);   // allow modem to boot
+
+  // GPIO2 wake pin
+  pinMode(HL_GP_2, INPUT);
+  digitalWrite(HL_GP_2, LOW);
+
+  delay(500);
+  SerialAT.begin(115200, SERIAL_8N1, 40, 41);
+  delay(100);
+
+  // Flush stale boot messages
+  while (SerialAT.available()) SerialAT.read();
+
+  // Wait for AT-OK handshake (5 retries)
+  uint8_t ok    = 0;
+  int     retry = 5;
+  do {
+    modem.sendAT("");
+    ok = modem.waitResponse();
+    retry--;
+  } while (ok != 1 && retry > 0);
+
+  if (ok == 1) {
+    SerialMon.println("sierra_Init(): Modem responding to AT -- OK");
+  } else {
+    SerialMon.println("sierra_Init(): WARNING -- modem not responding, continuing anyway");
+  }
+
+  // Disable hardware flow control (RTS/CTS not wired on this board)
+  modem.sendAT("+IFC=0,0");
+  if (modem.waitResponse() == 1) {
+    SerialMon.println("sierra_Init(): Flow control disabled OK");
+  } else {
+    SerialMon.println("sierra_Init(): Flow control command failed");
+  }
+}
+
+// ============================================================
+//  connectNetwork() – LTE registration + GPRS attach
+// ============================================================
+void connectNetwork() {
+  SerialMon.println("connectNetwork(): Waiting for LTE registration...");
+  if (!modem.waitForNetwork(60000UL)) {
+    SerialMon.println("connectNetwork(): FAILED -- rebooting");
+    delay(1000);
+    ESP.restart();
+  }
+  SerialMon.print("connectNetwork(): Operator = ");
+  SerialMon.println(modem.getOperator());
+
+  SerialMon.println("connectNetwork(): Attaching GPRS...");
+  if (!modem.gprsConnect(apn, user, pass)) {
+    SerialMon.println("connectNetwork(): GPRS FAILED -- rebooting");
+    delay(1000);
+    ESP.restart();
+  }
+  SerialMon.print("connectNetwork(): GPRS connected. IP = ");
+  SerialMon.println(modem.localIP());
+}
+
+// ============================================================
+//  performOTA() – check GitHub Pages and flash if newer
+// ============================================================
+void performOTA() {
+  SerialMon.println("\n--- performOTA(): Starting");
+  SerialMon.print("    Device version : "); SerialMon.println(FIRMWARE_VERSION);
+
+  // ── Step 1: fetch version.txt ────────────────────────────────
+  SerialMon.println("    Connecting to GitHub Pages for version check...");
+  if (!client.connect(OTA_SERVER, OTA_PORT)) {
+    SerialMon.println("    ERROR: Cannot connect to server -- skipping OTA");
+    return;
+  }
+
+  client.print(String("GET ") + OTA_VERSION_PATH + " HTTP/1.0\r\n" +
+               "Host: " + OTA_SERVER + "\r\n" +
+               "Connection: close\r\n\r\n");
+
+  // Skip HTTP response headers
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  String serverVersion = client.readStringUntil('\n');
+  serverVersion.trim();   // remove any trailing \r or whitespace
+  client.stop();
+
+  SerialMon.print("    Server version  : "); SerialMon.println(serverVersion);
+
+  if (serverVersion == FIRMWARE_VERSION) {
+    SerialMon.println("    Firmware is current -- no update needed");
+    SerialMon.println("--- performOTA(): Done\n");
+    return;
+  }
+
+  // ── Step 2: download firmware.bin ────────────────────────────
+  SerialMon.println("    New firmware available -- connecting for download...");
+  if (!client.connect(OTA_SERVER, OTA_PORT)) {
+    SerialMon.println("    ERROR: Cannot connect for download -- aborting");
+    return;
+  }
+
+  client.print(String("GET ") + OTA_FIRMWARE_PATH + " HTTP/1.0\r\n" +
+               "Host: " + OTA_SERVER + "\r\n" +
+               "Connection: close\r\n\r\n");
+
+  // Parse Content-Length from response headers
+  int  contentLength = 0;
+  bool foundLength   = false;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line.startsWith("Content-Length:")) {
+      contentLength = line.substring(15).toInt();
+      foundLength   = true;
+      SerialMon.print("    Content-Length  : "); SerialMon.print(contentLength); SerialMon.println(" bytes");
+    }
+    if (line == "\r") break;   // end of headers -- body follows
+  }
+
+  if (!foundLength || contentLength == 0) {
+    SerialMon.println("    ERROR: Content-Length missing -- aborting");
+    client.stop();
+    return;
+  }
+
+  // ── Step 3: stream binary into ESP32 flash ───────────────────
+  if (!Update.begin(contentLength)) {
+    SerialMon.print("    ERROR: Update.begin() failed -- ");
+    SerialMon.println(Update.getError());
+    client.stop();
+    return;
+  }
+
+  SerialMon.println("    Flashing -- do NOT power off...");
+  size_t written = Update.writeStream(client);
+  client.stop();
+
+  SerialMon.print("    Bytes written   : "); SerialMon.println(written);
+
+  if (!Update.end() || !Update.isFinished()) {
+    SerialMon.print("    ERROR: Flash failed -- ");
+    SerialMon.println(Update.getError());
+    return;
+  }
+
+  // ── Step 4: success ──────────────────────────────────────────
+  SerialMon.println("    OTA SUCCESS -- rebooting into new firmware");
+  delay(1000);
+  ESP.restart();
+}
+
+// ============================================================
+//  setup()
+// ============================================================
+void setup() {
+  SerialMon.begin(115200);
+  delay(500);
+
+  SerialMon.println("========================================");
+  SerialMon.println("  FeedTech OTA Test Sketch");
+  SerialMon.print  ("  Firmware: "); SerialMon.println(FIRMWARE_VERSION);
+  SerialMon.println("========================================");
+
+  // Boot modem and attach to network
+  sierra_Init();
+  connectNetwork();
+
+  // Run OTA check immediately on startup
+  performOTA();
+
+  SerialMon.println("setup() complete -- Hello World loop starting");
+}
+
+// ============================================================
+//  loop()
+// ============================================================
+void loop() {
+  // Print Hello World every 5 seconds
+  if (millis() - lastHelloMillis >= HELLO_INTERVAL) {
+    lastHelloMillis = millis();
+    SerialMon.print("Hello World -- firmware ");
+    SerialMon.print(FIRMWARE_VERSION);
+    SerialMon.print(" -- uptime ");
+    SerialMon.print(millis() / 1000);
+    SerialMon.println(" s");
+  }
+
+  // Periodic OTA check every hour
+  static unsigned long lastOTACheck = 0;
+  if (millis() - lastOTACheck >= OTA_CHECK_INTERVAL) {
+    lastOTACheck = millis();
+    performOTA();
+  }
+}
